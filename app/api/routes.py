@@ -1,3 +1,7 @@
+import logging
+from redis.exceptions import RedisError
+from app.queue import enqueue
+
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated
@@ -10,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_session
 from app.models import Job, JobStatus
 from app.schemas import JobCreate, JobList, JobOut
+
+log = logging.getLogger("api")
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -50,8 +56,15 @@ async def submit_job(
         response.status_code = status.HTTP_200_OK
         return existing
 
+    
     await session.commit()
-    # Step 4: enqueue job.id to Redis here (after commit!)
+    if job.status == JobStatus.PENDING:  # scheduled jobs are enqueued later by the scheduler
+        try:
+            await enqueue(job.id, job.priority, job.created_at)
+        except RedisError:
+            # Job is safely committed in the DB; the reconciler will enqueue it.
+            log.warning("Enqueue failed, reconciler will retry", extra={"job_id": str(job.id)})
+    
     return job
 
 

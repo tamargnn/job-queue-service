@@ -58,9 +58,9 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    # Graceful shutdown: Docker waits up to 30s after SIGTERM before SIGKILL.
-    # Default is 10s - too short for a 5s report job + cleanup.
-    stop_grace_period: 30s
+    # Graceful shutdown: Docker waits up to 130s after SIGTERM before SIGKILL.
+    # Default is 10s. Must exceed the longest job timeout (batch = 120s) so any valid job can finish
+    stop_grace_period: 130s
 
 volumes:
   postgres_data:

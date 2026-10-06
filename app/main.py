@@ -5,6 +5,9 @@ from sqlalchemy import text
 from app.config import settings
 from app.db import engine
 from app.api.routes import router as jobs_router
+from app.logging_config import configure_logging
+
+configure_logging()
 
 app = FastAPI(title="Job Queue Service")
 
