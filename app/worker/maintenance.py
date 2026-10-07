@@ -6,7 +6,8 @@ from sqlalchemy import func, select, update
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Job, JobStatus
+from app.job_log import record_event
+from app.models import Job, JobStatus, LogLevel
 from app.queue import enqueue
 
 log = logging.getLogger("maintenance")
@@ -57,7 +58,10 @@ async def reap_expired_leases() -> None:
         {**released, "status": JobStatus.PENDING,
          "error_message": "Worker lost (lease expired); re-queued"},
     )
+    for job_id, _priority, _created_at in dead:
+        await record_event(job_id, LogLevel.ERROR, "Worker lost (lease expired); max attempts reached, job failed")
     for job_id, priority, created_at in retry:
+        await record_event(job_id, LogLevel.WARNING, "Worker lost (lease expired); job re-queued")
         await enqueue(job_id, priority, created_at)
     if dead or retry:
         log.warning(f"Reaper: {len(retry)} re-queued, {len(dead)} failed permanently")

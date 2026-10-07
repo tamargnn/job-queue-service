@@ -1,19 +1,19 @@
 import logging
-from redis.exceptions import RedisError
-from app.queue import enqueue, remove
-
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from redis.exceptions import RedisError
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_session
-from app.models import CANCELLABLE_STATUSES, Job, JobStatus
-from app.schemas import JobCreate, JobList, JobOut
+from app.job_log import record_event
+from app.models import CANCELLABLE_STATUSES, Job, JobLog, JobStatus, LogLevel
+from app.queue import enqueue, remove
+from app.schemas import JobCreate, JobList, JobLogList, JobOut
 
 log = logging.getLogger("api")
 
@@ -56,24 +56,38 @@ async def submit_job(
         response.status_code = status.HTTP_200_OK
         return existing
 
-    
     await session.commit()
+    # Logged before enqueueing so "submitted" always precedes the worker's "started" entry.
+    await record_event(
+        job.id, LogLevel.INFO, "Job submitted",
+        {"job_type": job.job_type, "priority": job.priority, "status": job.status.value},
+    )
     if job.status == JobStatus.PENDING:  # scheduled jobs are enqueued later by the scheduler
         try:
             await enqueue(job.id, job.priority, job.created_at)
         except RedisError:
             # Job is safely committed in the DB; the reconciler will enqueue it.
             log.warning("Enqueue failed, reconciler will retry", extra={"job_id": str(job.id)})
-    
+
     return job
 
 
 @router.get("/{job_id}", response_model=JobOut)
 async def get_job(job_id: uuid.UUID, session: SessionDep) -> Job:
-    job = await session.get(Job, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return await _get_or_404(session, job_id)
+
+
+@router.get("/{job_id}/logs", response_model=JobLogList)
+async def get_job_logs(job_id: uuid.UUID, session: SessionDep) -> dict:
+    await _get_or_404(session, job_id)
+    query = select(JobLog).where(JobLog.job_id == job_id).order_by(JobLog.created_at, JobLog.id)
+    entries = (await session.scalars(query)).all()
+    return {
+        "items": [
+            {"id": e.id, "level": e.level, "message": e.message, "details": e.extra, "created_at": e.created_at}
+            for e in entries
+        ]
+    }
 
 
 @router.get("", response_model=JobList)
@@ -115,6 +129,7 @@ async def cancel_job(job_id: uuid.UUID, session: SessionDep) -> Job:
         existing = await _get_or_404(session, job_id)
         raise HTTPException(status_code=409, detail=f"Cannot cancel job in status '{existing.status}'")
     await session.commit()
+    await record_event(job.id, LogLevel.INFO, "Job cancelled")
     try:
         await remove(job.id)  # cleanup only; if it fails, the worker's claim will skip it anyway
     except RedisError:
@@ -140,6 +155,7 @@ async def retry_job(job_id: uuid.UUID, session: SessionDep) -> Job:
         existing = await _get_or_404(session, job_id)
         raise HTTPException(status_code=409, detail=f"Only failed jobs can be retried (status: '{existing.status}')")
     await session.commit()
+    await record_event(job.id, LogLevel.INFO, "Job manually retried; attempts reset")
     try:
         await enqueue(job.id, job.priority, job.created_at)
     except RedisError:

@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from app.models import JobStatus
+from app.models import JobStatus, LogLevel
 
 JobTypeName = Literal["email", "webhook", "report", "batch"]
 
@@ -42,3 +42,15 @@ class JobList(BaseModel):
     items: list[JobOut]
     limit: int
     offset: int
+
+
+class JobLogOut(BaseModel):
+    id: int
+    level: LogLevel
+    message: str
+    details: dict[str, Any] | None
+    created_at: datetime
+
+
+class JobLogList(BaseModel):
+    items: list[JobLogOut]

@@ -12,8 +12,9 @@ from sqlalchemy import func, update
 
 from app.config import settings
 from app.db import SessionLocal, engine
+from app.job_log import record_event
 from app.logging_config import configure_logging
-from app.models import Job, JobStatus
+from app.models import Job, JobStatus, LogLevel
 from app.queue import pop_job, redis_client
 from app.worker.handlers import HANDLERS, JOB_TIMEOUTS, JobContext, PermanentJobError
 from app.worker.maintenance import maintenance_loop
@@ -69,12 +70,18 @@ async def fail(job: Job, error: str, details: dict | None, retryable: bool = Tru
                                 run_at=func.now() + timedelta(seconds=delay))
         log.warning(f"Job failed, retry in {delay:.0f}s: {error}",
                     extra={"job_id": str(job.id), "attempt": job.attempts})
+        event = (LogLevel.WARNING, f"Attempt {job.attempts}/{job.max_attempts} failed: {error}; "
+                                   f"retry in {delay:.0f}s")
     else:
         ok = await update_owned(job.id, **released, status=JobStatus.FAILED, completed_at=func.now())
         log.error(f"Job failed permanently: {error}",
                   extra={"job_id": str(job.id), "attempt": job.attempts})
-    if not ok:
+        event = (LogLevel.ERROR, f"Job failed permanently after attempt {job.attempts}/{job.max_attempts}: {error}")
+    if ok:
+        await record_event(job.id, *event)
+    else:
         log.warning("Lease lost before failure could be recorded", extra={"job_id": str(job.id)})
+        await record_event(job.id, LogLevel.WARNING, "Lease lost before failure could be recorded")
 
 
 async def heartbeat(job_id: uuid.UUID, work: asyncio.Task, lease_lost: asyncio.Event) -> None:
@@ -98,6 +105,8 @@ async def process(job_id: uuid.UUID) -> None:
     ctx_log = {"job_id": str(job.id), "job_type": job.job_type,
                "attempt": job.attempts, "worker_id": WORKER_ID}
     log.info("Job started", extra=ctx_log)
+    await record_event(job.id, LogLevel.INFO, f"Attempt {job.attempts}/{job.max_attempts} started",
+                       {"worker_id": WORKER_ID})
 
     handler = HANDLERS.get(job.job_type)
     if handler is None:
@@ -116,12 +125,16 @@ async def process(job_id: uuid.UUID) -> None:
                                 completed_at=func.now(), locked_by=None, lease_expires_at=None)
         if ok:
             log.info("Job completed", extra=ctx_log)
+            await record_event(job.id, LogLevel.INFO, "Job completed", {"worker_id": WORKER_ID})
         else:
             log.warning("Lease lost before completion; result discarded", extra=ctx_log)
+            await record_event(job.id, LogLevel.WARNING, "Lease lost before completion; result discarded")
     except asyncio.CancelledError:
         if not lease_lost.is_set():
             raise
         log.warning("Lease lost during execution; job abandoned", extra=ctx_log)
+        await record_event(job.id, LogLevel.WARNING, "Lease lost during execution; worker abandoned the job",
+                           {"worker_id": WORKER_ID})
     except TimeoutError:
         await fail(job, f"Job timed out after {timeout}s", {"type": "TimeoutError"})
     except PermanentJobError as e:
@@ -131,6 +144,24 @@ async def process(job_id: uuid.UUID) -> None:
                    {"type": type(e).__name__, "traceback": traceback.format_exc()})
     finally:
         hb.cancel()
+
+
+async def worker_loop(stop: asyncio.Event) -> None:
+    """Pull and run jobs until `stop` is set. The job in progress always finishes first;
+    `stop` is only checked between jobs (graceful shutdown)."""
+    while not stop.is_set():
+        try:
+            job_id = await pop_job(timeout=1)  # 1s timeout keeps us responsive to shutdown
+        except Exception:
+            log.exception("Queue error")
+            await asyncio.sleep(1)
+            continue
+        if job_id is None:
+            continue
+        try:
+            await process(job_id)
+        except Exception:
+            log.exception("Unexpected error processing job", extra={"job_id": str(job_id)})
 
 
 async def main() -> None:
@@ -143,19 +174,7 @@ async def main() -> None:
     log.info("Worker started", extra={"worker_id": WORKER_ID})
     maintenance = asyncio.create_task(maintenance_loop(stop))
 
-    while not stop.is_set():
-        try:
-            job_id = await pop_job(timeout=1)  # 1s timeout keeps us responsive to shutdown
-        except Exception:
-            log.exception("Queue error")
-            await asyncio.sleep(1)
-            continue
-        if job_id is None:
-            continue
-        try:
-            await process(job_id)  # current job always finishes before we check `stop` again
-        except Exception:
-            log.exception("Unexpected error processing job", extra={"job_id": str(job_id)})
+    await worker_loop(stop)
 
     log.info("Shutdown: current job finished, exiting", extra={"worker_id": WORKER_ID})
     await maintenance
