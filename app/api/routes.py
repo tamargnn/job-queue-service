@@ -1,18 +1,18 @@
 import logging
 from redis.exceptions import RedisError
-from app.queue import enqueue
+from app.queue import enqueue, remove
 
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_session
-from app.models import Job, JobStatus
+from app.models import CANCELLABLE_STATUSES, Job, JobStatus
 from app.schemas import JobCreate, JobList, JobOut
 
 log = logging.getLogger("api")
@@ -91,3 +91,57 @@ async def list_jobs(
         query = query.where(Job.job_type == job_type)
     jobs = (await session.scalars(query)).all()
     return {"items": jobs, "limit": limit, "offset": offset}
+
+
+async def _get_or_404(session: AsyncSession, job_id: uuid.UUID) -> Job:
+    job = await session.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.post("/{job_id}/cancel", response_model=JobOut)
+async def cancel_job(job_id: uuid.UUID, session: SessionDep) -> Job:
+    # Conditional update: races safely with a worker claiming the same job (row lock decides)
+    stmt = (
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(CANCELLABLE_STATUSES))
+        .values(status=JobStatus.CANCELLED, completed_at=func.now())
+        .returning(Job)
+        .execution_options(synchronize_session=False)
+    )
+    job = (await session.execute(stmt)).scalar_one_or_none()
+    if job is None:
+        existing = await _get_or_404(session, job_id)
+        raise HTTPException(status_code=409, detail=f"Cannot cancel job in status '{existing.status}'")
+    await session.commit()
+    try:
+        await remove(job.id)  # cleanup only; if it fails, the worker's claim will skip it anyway
+    except RedisError:
+        log.warning("Failed to remove cancelled job from queue", extra={"job_id": str(job.id)})
+    return job
+
+
+@router.post("/{job_id}/retry", response_model=JobOut)
+async def retry_job(job_id: uuid.UUID, session: SessionDep) -> Job:
+    stmt = (
+        update(Job)
+        .where(Job.id == job_id, Job.status == JobStatus.FAILED)
+        .values(
+            status=JobStatus.PENDING, attempts=0, run_at=func.now(), progress=0,
+            error_message=None, error_details=None, result=None,
+            started_at=None, completed_at=None,
+        )
+        .returning(Job)
+        .execution_options(synchronize_session=False)
+    )
+    job = (await session.execute(stmt)).scalar_one_or_none()
+    if job is None:
+        existing = await _get_or_404(session, job_id)
+        raise HTTPException(status_code=409, detail=f"Only failed jobs can be retried (status: '{existing.status}')")
+    await session.commit()
+    try:
+        await enqueue(job.id, job.priority, job.created_at)
+    except RedisError:
+        log.warning("Enqueue failed, reconciler will retry", extra={"job_id": str(job.id)})
+    return job
